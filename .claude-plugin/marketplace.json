@@ -1,0 +1,21 @@
+{
+  "name": "katshun0307",
+  "owner": {
+    "name": "katshun0307"
+  },
+  "metadata": {
+    "description": "個人用の Claude Code plugin",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "review-draft",
+      "description": "Linear / esa / GitHub に投稿する日本語の下書きを, 書き込み前に規範と照合する hook.",
+      "version": "0.1.0",
+      "author": {
+        "name": "katshun0307"
+      },
+      "source": "./plugins/review-draft"
+    }
+  ]
+}
