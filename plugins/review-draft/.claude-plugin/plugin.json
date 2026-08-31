@@ -1,6 +1,6 @@
 {
   "name": "review-draft",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Linear / esa / GitHub に投稿する日本語の下書きを, 書き込み前に規範と照合する hook. 機械チェックと, 文脈を持たない haiku 2 本で 5s 程度で判定し, 止めた書き込みは指摘を反映して呼び直すまで見届ける.",
   "author": {
     "name": "katshun0307"
