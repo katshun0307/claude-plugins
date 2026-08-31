@@ -2,7 +2,7 @@
 
 外部に出す日本語の文章が満たすべき規範のうち, 機械判定できないものだけを並べる.
 文体 (常体, カンマとピリオド, ダッシュ, 中黒) と Markdown の構造は
-`~/.claude/hooks/review-draft-gate.py` が書き込み前に検査済みなので, 重複して指摘しない.
+`~/.claude/hooks/review-draft-gate.py` が同じ本文を検査済みなので, 重複して指摘しない.
 全文は `~/.claude/hooks/review-draft/writing-rules.md` にある.
 
 ## 1. 記載範囲

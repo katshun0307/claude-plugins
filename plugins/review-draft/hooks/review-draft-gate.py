@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """外部に出る日本語の文章を, 機械判定できる規範だけで検査する hook.
 
-対象は 3 つある.
+対象は 2 つある.
 
-- PreToolUse: Linear / esa / GitHub への書き込みと, gh コマンドでの PR / issue 本文
-- PostToolUse: 書き込みが通ったことを記録して, 未完フラグを畳む
-- Stop: 未完のまま終わろうとしていないかと, そのターンで user に出したチャットの文章.
+- PostToolUse: Linear / esa / GitHub への書き込みと, gh コマンドでの PR / issue 本文
+- Stop: そのターンで user に出したチャットの文章.
   文体は個人の規範なので, 環境変数 REVIEW_DRAFT_CHAT_STYLE=1 を置いた人にだけ効く
 
 意味的なレビュー (素読み, 事実と推測の分離, 記載範囲) はここでは扱わない.
 そちらは prompt hook と agent hook が受け持つ.
 
-hook に止められた書き込みは, 指摘を反映して呼び直すまでが 1 つの作業である.
-deny を受けて user に判断を投げ返すと作業が宙に浮くので, PreToolUse で未完フラグを立て,
-PostToolUse で畳み, Stop で立ったままなら押し戻す.
+書き込みは止めない. PreToolUse で deny すると, 直せる指摘のために投稿が毎回止まり,
+user に判断が投げ返される. 書き込みが通ったあとに指摘だけを additionalContext で返し,
+書き直すかどうかは Claude に決めさせる.
 
 検査対象から除外するもの:
 - code fence の中身 (log や設定の貼り付け)
@@ -24,7 +23,6 @@ import json
 import os
 import re
 import sys
-import time
 
 # チャットの文体検査は個人の規範なので, 明示的に有効にした人にだけ効かせる
 CHAT_STYLE_ENV = "REVIEW_DRAFT_CHAT_STYLE"
@@ -34,14 +32,12 @@ RULES_DOC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 
 MIN_LEN_TOOL = 20   # これより短い本文は検査しない
 MIN_LEN_CHAT = 25   # チャットは短い応答が多いので閾値を上げる
-MAX_BLOCKS = 3      # 同一 session で連続 deny する上限. 超えたら人の判断に委ねる
-MAX_CHAT_BLOCKS = 1  # 1 ターンで deny する上限
-PENDING_TTL = 900   # 未完フラグの有効期間 (秒). これより古ければ押し戻さない
-MAX_PUSHBACKS = 3   # 同じ書き込みを Stop で押し戻す上限. 超えたら黙って通す
+MAX_CHAT_FEEDBACKS = 1  # 1 ターンでチャット文体を差し戻す上限
 
-# deny の理由に必ず添える. これが無いと deny が「user に報告して終わる合図」に読める
-RESUME = ("指摘を反映して同じ tool を呼び直せ."
-          " 直せる指摘は user に確認を取らずに直せ.")
+# 指摘に必ず添える. 指摘だけを返すと「user に報告して終わる合図」に読まれるので,
+# 反映するかを Claude が選べることと, 見送るときの振る舞いを書いておく
+CHOICE = ("反映する価値があると判断したら, 同じ tool で本文を書き直せ."
+          " user への確認は要らない. 見送るならその判断を user に一言添えよ.")
 
 TEXT_KEYS = ("title", "name", "description", "body", "body_md", "content")
 PATCH_KEYS = ("new_string", "text")
@@ -194,35 +190,6 @@ def state_path(key, suffix=".count"):
     return os.path.join(directory, safe + suffix)
 
 
-def pending_path(session_id):
-    """書き込みが未完のまま残っているかを持つファイル."""
-    return state_path("pending-" + (session_id or ""), ".json")
-
-
-def read_pending(path):
-    try:
-        with open(path) as handle:
-            data = json.load(handle)
-    except (IOError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def write_pending(path, data):
-    try:
-        with open(path, "w") as handle:
-            json.dump(data, handle)
-    except IOError:
-        pass
-
-
-def clear_pending(path):
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-
-
 def read_count(path):
     try:
         with open(path) as handle:
@@ -265,51 +232,37 @@ def build_reason(findings, header):
 
 
 def handle_post_tool_use(event):
-    """書き込みが通ったので未完フラグを畳む."""
+    """書き込みが通った本文を検査して, 指摘を additionalContext で返す."""
     tool_name = event.get("tool_name", "")
+    tool_input = event.get("tool_input") or {}
+    if not isinstance(tool_input, dict):
+        sys.exit(0)
+
     if tool_name == "Bash":
-        command = (event.get("tool_input") or {}).get("command")
-        if not isinstance(command, str) or not GH_WRITE.search(command):
-            sys.exit(0)
-    path = pending_path(event.get("session_id", ""))
-    pending = read_pending(path)
-    if pending and pending.get("tool") == tool_name:
-        clear_pending(path)
-        write_count(state_path(event.get("session_id", "")), 0)
-    sys.exit(0)
+        command = tool_input.get("command")
+        segments = collect_from_bash(command) if isinstance(command, str) else []
+    else:
+        segments = collect_from_tool_input(tool_input)
 
+    if sum(len(text) for _, text in segments) < MIN_LEN_TOOL:
+        sys.exit(0)
 
-def handle_unfinished_write(event):
-    """止められた書き込みを未完のままターンを終えようとしたら押し戻す.
+    findings = []
+    for label, text in segments:
+        findings.extend(inspect(label, text, tool_name, draft=True))
+    if not findings:
+        sys.exit(0)
 
-    押し戻すのは 1 回の試行につき 1 回だけである. さらに試行そのものを数え,
-    MAX_PUSHBACKS を超えたら黙って通す. prompt hook は毎回別の指摘を返しうるので,
-    上限が無いと直せない指摘で往復し続ける.
-    """
-    path = pending_path(event.get("session_id", ""))
-    pending = read_pending(path)
-    if not pending:
-        return
-    if pending.get("nagged") or pending.get("exhausted"):
-        return
-    if time.time() - float(pending.get("at") or 0) > PENDING_TTL:
-        clear_pending(path)
-        return
-    if int(pending.get("tries") or 1) > MAX_PUSHBACKS:
-        pending["nagged"] = True
-        pending["exhausted"] = True
-        write_pending(path, pending)
-        return
-    pending["nagged"] = True
-    write_pending(path, pending)
+    reason = build_reason(
+        findings,
+        "書き込んだ本文の機械チェックで規範違反を検出した.\n"
+        + CHOICE + "\n"
+        "これは機械判定だけである. 素読みや事実と推測の分離は検査していない.")
     emit({
-        "decision": "block",
-        "reason": (
-            "hook に止められた %s の書き込みが, 未完のまま残っている.\n"
-            "%s\n"
-            "書き込みをやめる判断をしたのなら, その理由を user に伝えてから終われ."
-            % (pending.get("tool") or "本文", RESUME)
-        ),
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": reason,
+        }
     })
 
 
@@ -329,81 +282,16 @@ def handle_chat_style(event):
                                  event.get("session_id") or ""))
     count = read_count(path) + 1
     write_count(path, count)
-    if count > MAX_CHAT_BLOCKS:
+    if count > MAX_CHAT_FEEDBACKS:
         sys.exit(0)
 
     reason = build_reason(
         findings,
         "直前のチャット出力が文体の規範に反している. 同じ内容を規範に沿って書き直して user に出し直せ.")
-    emit({"decision": "block", "reason": reason})
-
-
-def handle_pre_tool_use(event):
-    tool_name = event.get("tool_name", "")
-    tool_input = event.get("tool_input") or {}
-    if not isinstance(tool_input, dict):
-        sys.exit(0)
-
-    if tool_name == "Bash":
-        command = tool_input.get("command")
-        segments = collect_from_bash(command) if isinstance(command, str) else []
-    else:
-        segments = collect_from_tool_input(tool_input)
-
-    if sum(len(text) for _, text in segments) < MIN_LEN_TOOL:
-        sys.exit(0)
-
-    # 本文を伴う書き込みを試みたことを記録する. 通れば PostToolUse が畳む.
-    # どの層かを問わず deny されるとフラグが残り, Stop が押し戻す.
-    flag_path = pending_path(event.get("session_id", ""))
-    previous = read_pending(flag_path) or {}
-    same = previous.get("tool") == tool_name
-    write_pending(flag_path, {
-        "tool": tool_name,
-        "at": time.time(),
-        "tries": int(previous.get("tries") or 0) + 1 if same else 1,
-        "nagged": False,
-        # 打ち切りは同じ書き込みに対して持ち越す. 試行を重ねて上限を戻せてしまうと,
-        # 直せない指摘で往復し続ける経路が残る
-        "exhausted": bool(same and previous.get("exhausted")),
-    })
-
-    findings = []
-    for label, text in segments:
-        findings.extend(inspect(label, text, tool_name, draft=True))
-
-    path = state_path(event.get("session_id", ""))
-    if not findings:
-        write_count(path, 0)
-        sys.exit(0)
-
-    count = read_count(path) + 1
-    write_count(path, count)
-    reason = build_reason(
-        findings,
-        "書き込み前の機械チェックで規範違反を検出した.\n"
-        + RESUME + "\n"
-        "これは機械判定だけである. 素読みや事実と推測の分離は検査していない.")
-
-    if count > MAX_BLOCKS:
-        write_count(path, 0)
-        # 人に委ねた時点で押し戻す相手が Claude ではなくなるので, フラグを畳む
-        clear_pending(pending_path(event.get("session_id", "")))
-        emit({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "ask",
-                "permissionDecisionReason":
-                    "機械チェックが %d 回連続で違反を検出したので, 判断を委ねる.\n\n%s"
-                    % (MAX_BLOCKS, reason),
-            }
-        })
-
     emit({
         "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
+            "hookEventName": "Stop",
+            "additionalContext": reason,
         }
     })
 
@@ -416,12 +304,9 @@ def main():
 
     name = event.get("hook_event_name")
     if name == "Stop":
-        handle_unfinished_write(event)
         handle_chat_style(event)
-    elif name == "PostToolUse":
-        handle_post_tool_use(event)
     else:
-        handle_pre_tool_use(event)
+        handle_post_tool_use(event)
 
 
 if __name__ == "__main__":

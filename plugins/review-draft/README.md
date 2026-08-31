@@ -1,6 +1,6 @@
 # review-draft
 
-Linear / esa / GitHub に投稿する日本語の文章を, 書き込みが実行される前に規範と照合する hook.
+Linear / esa / GitHub に投稿する日本語の文章を, 書き込みが実行された直後に規範と照合する hook.
 
 自分で書いた文章を自分で読み返すと, 会話で共有済みの前提を補って読んでしまう. hook の判定役は会話を一切持たないので, issue や PR を初めて開く読者と同じ条件で読む.
 
@@ -16,16 +16,16 @@ Linear / esa / GitHub に投稿する日本語の文章を, 書き込みが実�
 
 prompt hook は並列に走るので, 待ち時間は遅い方の 1 本ぶんで済む.
 
-違反があれば書き込みが deny され, 理由が Claude に返る. Claude が直して書き込み直す.
+3 層とも PostToolUse に置いてある. 違反があっても書き込みは止まらず, 指摘だけが Claude に返る. 反映して書き直すか, 見送って user に伝えるかは Claude が決める.
 
-## 止められた書き込みを最後まで運ばせる
+## 書き込みを止めずに指摘を返す
 
-deny の理由だけを返すと, Claude はそれを「user に報告して判断を仰ぐ合図」と読み, 指摘を持ったままターンを終えることがある. 作業が宙に浮くので 2 つで押さえる.
+検査は PostToolUse に置いてある. 投稿を止める経路が無いので, 指摘が的外れでも作業は止まらない.
 
-- deny の理由に「指摘を反映して同じ tool を呼び直せ」を必ず添える. 機械チェックは固定文で, prompt hook は出力テンプレートに書き写させる
-- PreToolUse で未完フラグを立て, PostToolUse で畳む. Stop の時点で立ったままなら, 書き込みが未完だと言って 1 回だけ押し戻す
+- 機械チェックは `hookSpecificOutput.additionalContext` で指摘を返す. エラーではなく素の文脈として届く
+- prompt hook は `ok: false` を返すと `decision: "block"` になる. tool は走り終えているので書き込みは止まらないが, `continueOnBlock: true` を付けないとターンが終わる
 
-押し戻しは 1 回きりである. 書き込みをやめる判断そのものは Claude と user に残す.
+指摘だけを返すと「user に報告して終わる合図」と読まれるので, 選べることを明示する文を必ず添える. 反映する価値があると判断したら同じ tool で書き直す, 見送るならその判断を user に一言添える, のどちらかである.
 
 prompt hook の指摘が毎回変わると収束しないので, 挙げてよい指摘の水準も prompt に固定してある. 逐語引用を添えられること, 直さなければ読者が誤解すること, 1 度に 2 件までである.
 
@@ -82,9 +82,8 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 
 ## 暴走の防ぎ方
 
-- PreToolUse は 3 回連続で deny したら `ask` に落とし, 人の判断に委ねる
-- 未完フラグによる押し戻しは 1 つの書き込みにつき 1 回だけである. 15 分より古いフラグは押し戻さない
-- Stop の文体チェックは prompt_id ごとに 1 回しか block しない
+- 書き込みそのものを止める経路が無い. 指摘が的外れでも投稿は通る
+- Stop の文体チェックは prompt_id ごとに 1 回しか差し戻さない
 - code fence, blockquote, inline code, indent された block は検査対象から外す. log や引用が引っかからない
 
 ## hook の実測仕様
@@ -93,6 +92,8 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 
 - `model` に `haiku` のような alias を書くと 404 になる. `claude-haiku-4-5-20251001` と完全な id を書く
 - prompt hook と agent hook が返すのは `{"ok": bool, "reason": str}` である. `hookSpecificOutput.permissionDecision` は解釈されない
+- prompt hook の `ok: false` は必ず `decision: "block"` になる. PreToolUse に置く限り書き込みは deny される. `continueOnBlock` が制御するのはターンを続けるかどうかだけで, tool の deny は取り消せない
+- PostToolUse の入力 JSON には `tool_response` が入る. Bash では実行結果ごと prompt hook に渡るので, 検査対象外だと prompt 側で明示する
 - Stop hook は `{"decision": "block", "reason": "..."}` を返す
 - `if` は permission rule を 1 つしか解釈しない. `|` で連結すると常に不一致になる
 - `if` は `&&` を含むコマンドを絞り込めない. `cd /tmp && echo done` は `Bash(gh pr create:*)` を含む全ての rule に「条件成立」と判定される. rule ごとに hook を分けて置くと, 1 コマンドにつき hook がその本数だけ走り, コマンドに混じった日本語が下書きとして deny される. Bash の絞り込みは prompt 側で行う

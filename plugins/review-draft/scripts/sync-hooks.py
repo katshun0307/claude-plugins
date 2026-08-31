@@ -14,9 +14,10 @@ hook は 3 層ある.
 
 prompt hook は同じ group 内で並列に走るので, 待ち時間は遅い方の 1 本ぶんで済む.
 
-deny された書き込みは, 指摘を反映して呼び直すまでが 1 つの作業である. これを保つのに
-2 つ置いている. 1 つは deny の理由に添える続行の指示 (OUTPUT), もう 1 つは PostToolUse と
-Stop に置いた未完フラグで, 止められたまま終わろうとしたら押し戻す.
+3 層とも PostToolUse に置く. 書き込みは止めず, 指摘だけを Claude に返す.
+反映するかは Claude が決める. PreToolUse に置くと prompt hook は ok: false を
+必ず deny に変換してしまい, 書き込みが止まる (continueOnBlock はターンの継続を
+制御するだけで, tool の deny は取り消せない).
 """
 import json
 import os
@@ -51,12 +52,14 @@ BASH_SCOPE = (
 )
 
 # prompt hook / agent hook は hookSpecificOutput ではなく ok / reason を返す.
-# deny の理由だけを返すと「user に報告して終わる合図」に読まれるので, 続行の指示を必ず添える.
+# 書き込みは既に通っているので, reason は「直せ」ではなく判断材料として返す.
+# ただし指摘だけを返すと「user に報告して終わる合図」に読まれるので, 選択肢を明示する.
 OUTPUT = (
     "出力は JSON だけにせよ. 前置きも説明も code fence も付けるな.\n"
     "問題が無い: {\"ok\": true}\n"
     "問題がある: {\"ok\": false, \"reason\": \"<指摘>\\n\\n"
-    "指摘を反映して同じ tool を呼び直せ. 直せる指摘は user に確認を取らずに直せ.\"}\n"
+    "書き込みは既に通っている. 反映する価値があると判断したら, 同じ tool で本文を書き直せ."
+    " 見送るならその判断を user に一言添えよ.\"}\n"
     "reason は日本語で書け. 末尾の 1 行はそのまま書き写せ."
 )
 
@@ -82,11 +85,13 @@ SCOPE = (
     "- 本文が 200 文字未満\n"
     "- 本文がここに含まれず --body-file のようなファイル参照になっている\n"
     "- patch で差分だけが渡された場合は, 差分に現れた記述だけを対象にする\n"
+    "\n"
+    "tool_response は書き込みの結果であって下書きではない. 検査せず, 引用もするな.\n"
     "\n" + BASH_SCOPE
 )
 
 READER_PROMPT = (
-    "$ARGUMENTS は Claude Code の PreToolUse hook の入力 JSON である.\n"
+    "$ARGUMENTS は Claude Code の PostToolUse hook の入力 JSON である.\n"
     + SCOPE +
     "\nあなたはこの文章を今初めて開いた開発チームのメンバーである."
     " 書かれた経緯も, これに至った会話も一切知らない."
@@ -109,7 +114,7 @@ def rules_prompt():
     with open(RULES) as handle:
         rules = handle.read().strip()
     return (
-        "$ARGUMENTS は Claude Code の PreToolUse hook の入力 JSON である.\n"
+        "$ARGUMENTS は Claude Code の PostToolUse hook の入力 JSON である.\n"
         + SCOPE +
         "\n本文を次の規範と照合せよ.\n\n"
         "<規範>\n" + rules + "\n</規範>\n\n"
@@ -139,6 +144,9 @@ def prompt_hook(prompt, status, extra=None):
         "model": MODEL,
         "statusMessage": status,
         "timeout": 25,
+        # ok: false は decision "block" になる. PostToolUse では tool は既に走り終えて
+        # いるので書き込みは止まらないが, これを付けないとターンが終わってしまう.
+        "continueOnBlock": True,
     }
     if extra:
         hook.update(extra)
@@ -150,41 +158,31 @@ def main():
     checker = rules_prompt()
 
     config = {
-        "description": "投稿前の下書きと, チャット出力を規範と照合する",
+        "description": "投稿後の下書きと, チャット出力を規範と照合する",
         "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": WRITE_TOOLS,
-                    "hooks": [
-                        gate_hook("下書きの機械チェック"),
-                        prompt_hook(reader, "文脈ゼロの素読み"),
-                        prompt_hook(checker, "規範との照合"),
-                    ],
-                },
-                {
-                    "matcher": "Bash",
-                    "hooks": [
-                        gate_hook("下書きの機械チェック"),
-                        prompt_hook(reader, "文脈ゼロの素読み"),
-                        prompt_hook(checker, "規範との照合"),
-                    ],
-                },
-            ],
-            # 書き込みが通ったことを記録して, Stop が押し戻す相手から外す
+            # 書き込みは止めない. 3 層の指摘をまとめて返し, 反映するかは Claude が決める
             "PostToolUse": [
                 {
                     "matcher": WRITE_TOOLS,
-                    "hooks": [gate_hook("書き込みの完了を記録")],
+                    "hooks": [
+                        gate_hook("下書きの機械チェック"),
+                        prompt_hook(reader, "文脈ゼロの素読み"),
+                        prompt_hook(checker, "規範との照合"),
+                    ],
                 },
                 {
                     "matcher": "Bash",
-                    "hooks": [gate_hook("書き込みの完了を記録")],
+                    "hooks": [
+                        gate_hook("下書きの機械チェック"),
+                        prompt_hook(reader, "文脈ゼロの素読み"),
+                        prompt_hook(checker, "規範との照合"),
+                    ],
                 },
             ],
             "Stop": [
                 {
                     "matcher": "*",
-                    "hooks": [gate_hook("未完の書き込みとチャット文体の機械チェック")],
+                    "hooks": [gate_hook("チャット文体の機械チェック")],
                 }
             ],
         },
