@@ -37,6 +37,7 @@ MIN_LEN_CHAT = 25   # チャットは短い応答が多いので閾値を上げ�
 MAX_BLOCKS = 3      # 同一 session で連続 deny する上限. 超えたら人の判断に委ねる
 MAX_CHAT_BLOCKS = 1  # 1 ターンで deny する上限
 PENDING_TTL = 900   # 未完フラグの有効期間 (秒). これより古ければ押し戻さない
+MAX_PUSHBACKS = 3   # 同じ書き込みを Stop で押し戻す上限. 超えたら黙って通す
 
 # deny の理由に必ず添える. これが無いと deny が「user に報告して終わる合図」に読める
 RESUME = ("指摘を反映して同じ tool を呼び直せ."
@@ -279,15 +280,28 @@ def handle_post_tool_use(event):
 
 
 def handle_unfinished_write(event):
-    """止められた書き込みを未完のままターンを終えようとしたら押し戻す."""
+    """止められた書き込みを未完のままターンを終えようとしたら押し戻す.
+
+    押し戻すのは 1 回の試行につき 1 回だけである. さらに試行そのものを数え,
+    MAX_PUSHBACKS を超えたら黙って通す. prompt hook は毎回別の指摘を返しうるので,
+    上限が無いと直せない指摘で往復し続ける.
+    """
     path = pending_path(event.get("session_id", ""))
     pending = read_pending(path)
     if not pending:
         return
-    # 押し戻すのは 1 回だけにする. 直せない指摘で往復し続けるのを避ける
-    clear_pending(path)
-    if time.time() - float(pending.get("at") or 0) > PENDING_TTL:
+    if pending.get("nagged") or pending.get("exhausted"):
         return
+    if time.time() - float(pending.get("at") or 0) > PENDING_TTL:
+        clear_pending(path)
+        return
+    if int(pending.get("tries") or 1) > MAX_PUSHBACKS:
+        pending["nagged"] = True
+        pending["exhausted"] = True
+        write_pending(path, pending)
+        return
+    pending["nagged"] = True
+    write_pending(path, pending)
     emit({
         "decision": "block",
         "reason": (
@@ -341,8 +355,18 @@ def handle_pre_tool_use(event):
 
     # 本文を伴う書き込みを試みたことを記録する. 通れば PostToolUse が畳む.
     # どの層かを問わず deny されるとフラグが残り, Stop が押し戻す.
-    write_pending(pending_path(event.get("session_id", "")),
-                  {"tool": tool_name, "at": time.time()})
+    flag_path = pending_path(event.get("session_id", ""))
+    previous = read_pending(flag_path) or {}
+    same = previous.get("tool") == tool_name
+    write_pending(flag_path, {
+        "tool": tool_name,
+        "at": time.time(),
+        "tries": int(previous.get("tries") or 0) + 1 if same else 1,
+        "nagged": False,
+        # 打ち切りは同じ書き込みに対して持ち越す. 試行を重ねて上限を戻せてしまうと,
+        # 直せない指摘で往復し続ける経路が残る
+        "exhausted": bool(same and previous.get("exhausted")),
+    })
 
     findings = []
     for label, text in segments:
