@@ -18,6 +18,17 @@ prompt hook は並列に走るので, 待ち時間は遅い方の 1 本ぶんで
 
 違反があれば書き込みが deny され, 理由が Claude に返る. Claude が直して書き込み直す.
 
+## 止められた書き込みを最後まで運ばせる
+
+deny の理由だけを返すと, Claude はそれを「user に報告して判断を仰ぐ合図」と読み, 指摘を持ったままターンを終えることがある. 作業が宙に浮くので 2 つで押さえる.
+
+- deny の理由に「指摘を反映して同じ tool を呼び直せ」を必ず添える. 機械チェックは固定文で, prompt hook は出力テンプレートに書き写させる
+- PreToolUse で未完フラグを立て, PostToolUse で畳む. Stop の時点で立ったままなら, 書き込みが未完だと言って 1 回だけ押し戻す
+
+押し戻しは 1 回きりである. 書き込みをやめる判断そのものは Claude と user に残す.
+
+prompt hook の指摘が毎回変わると収束しないので, 挙げてよい指摘の水準も prompt に固定してある. 逐語引用を添えられること, 直さなければ読者が誤解すること, 1 度に 2 件までである.
+
 ## 発火する場所
 
 - Linear の issue 本文, コメント, document
@@ -27,6 +38,8 @@ prompt hook は並列に走るので, 待ち時間は遅い方の 1 本ぶんで
 - チャット出力 (機械チェックのみ. 既定では無効)
 
 `gh` は heredoc, `--body`, `--body-file` のどれからでも本文を取り出す. ただし `--body-file` の中身を読めるのは機械チェックだけで, prompt hook は Read を持たないので検査しない.
+
+Bash の絞り込みに `if` は使っていない. 理由は後述する. 代わりに prompt の中で「gh の書き込みコマンドの本文以外は必ず ok を返す」と指示している.
 
 ## 導入
 
@@ -70,7 +83,8 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 ## 暴走の防ぎ方
 
 - PreToolUse は 3 回連続で deny したら `ask` に落とし, 人の判断に委ねる
-- Stop は prompt_id ごとに 1 回しか block しない
+- 未完フラグによる押し戻しは 1 つの書き込みにつき 1 回だけである. 15 分より古いフラグは押し戻さない
+- Stop の文体チェックは prompt_id ごとに 1 回しか block しない
 - code fence, blockquote, inline code, indent された block は検査対象から外す. log や引用が引っかからない
 
 ## hook の実測仕様
@@ -80,4 +94,13 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 - `model` に `haiku` のような alias を書くと 404 になる. `claude-haiku-4-5-20251001` と完全な id を書く
 - prompt hook と agent hook が返すのは `{"ok": bool, "reason": str}` である. `hookSpecificOutput.permissionDecision` は解釈されない
 - Stop hook は `{"decision": "block", "reason": "..."}` を返す
-- `if` は permission rule を 1 つしか解釈しない. `|` で連結すると常に不一致になるので rule ごとに hook を分ける
+- `if` は permission rule を 1 つしか解釈しない. `|` で連結すると常に不一致になる
+- `if` は `&&` を含むコマンドを絞り込めない. `cd /tmp && echo done` は `Bash(gh pr create:*)` を含む全ての rule に「条件成立」と判定される. rule ごとに hook を分けて置くと, 1 コマンドにつき hook がその本数だけ走り, コマンドに混じった日本語が下書きとして deny される. Bash の絞り込みは prompt 側で行う
+
+`if` の判定は headless で確かめられる.
+
+```bash
+claude -p 'Run exactly this bash command, nothing else: cd /tmp && echo done' \
+  --debug hooks --debug-file ./probe.log
+grep -c 'Skipping hook due to if condition' probe.log
+```

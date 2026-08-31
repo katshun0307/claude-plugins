@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """外部に出る日本語の文章を, 機械判定できる規範だけで検査する hook.
 
-対象は 2 つある.
+対象は 3 つある.
 
 - PreToolUse: Linear / esa / GitHub への書き込みと, gh コマンドでの PR / issue 本文
-- Stop: そのターンで user に出したチャットの文章.
+- PostToolUse: 書き込みが通ったことを記録して, 未完フラグを畳む
+- Stop: 未完のまま終わろうとしていないかと, そのターンで user に出したチャットの文章.
   文体は個人の規範なので, 環境変数 REVIEW_DRAFT_CHAT_STYLE=1 を置いた人にだけ効く
 
 意味的なレビュー (素読み, 事実と推測の分離, 記載範囲) はここでは扱わない.
 そちらは prompt hook と agent hook が受け持つ.
+
+hook に止められた書き込みは, 指摘を反映して呼び直すまでが 1 つの作業である.
+deny を受けて user に判断を投げ返すと作業が宙に浮くので, PreToolUse で未完フラグを立て,
+PostToolUse で畳み, Stop で立ったままなら押し戻す.
 
 検査対象から除外するもの:
 - code fence の中身 (log や設定の貼り付け)
@@ -19,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 
 # チャットの文体検査は個人の規範なので, 明示的に有効にした人にだけ効かせる
 CHAT_STYLE_ENV = "REVIEW_DRAFT_CHAT_STYLE"
@@ -30,6 +36,11 @@ MIN_LEN_TOOL = 20   # これより短い本文は検査しない
 MIN_LEN_CHAT = 25   # チャットは短い応答が多いので閾値を上げる
 MAX_BLOCKS = 3      # 同一 session で連続 deny する上限. 超えたら人の判断に委ねる
 MAX_CHAT_BLOCKS = 1  # 1 ターンで deny する上限
+PENDING_TTL = 900   # 未完フラグの有効期間 (秒). これより古ければ押し戻さない
+
+# deny の理由に必ず添える. これが無いと deny が「user に報告して終わる合図」に読める
+RESUME = ("指摘を反映して同じ tool を呼び直せ."
+          " 直せる指摘は user に確認を取らずに直せ.")
 
 TEXT_KEYS = ("title", "name", "description", "body", "body_md", "content")
 PATCH_KEYS = ("new_string", "text")
@@ -171,7 +182,7 @@ def inspect(label, text, tool_name, draft):
     return findings
 
 
-def state_path(key):
+def state_path(key, suffix=".count"):
     tmp = os.environ.get("TMPDIR", "/tmp")
     directory = os.path.join(tmp, "claude-review-draft-gate")
     try:
@@ -179,7 +190,36 @@ def state_path(key):
     except OSError:
         pass
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", key or "no-key")
-    return os.path.join(directory, safe + ".count")
+    return os.path.join(directory, safe + suffix)
+
+
+def pending_path(session_id):
+    """書き込みが未完のまま残っているかを持つファイル."""
+    return state_path("pending-" + (session_id or ""), ".json")
+
+
+def read_pending(path):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except (IOError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_pending(path, data):
+    try:
+        with open(path, "w") as handle:
+            json.dump(data, handle)
+    except IOError:
+        pass
+
+
+def clear_pending(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def read_count(path):
@@ -223,7 +263,43 @@ def build_reason(findings, header):
     return "\n".join(lines)
 
 
-def handle_stop(event):
+def handle_post_tool_use(event):
+    """書き込みが通ったので未完フラグを畳む."""
+    tool_name = event.get("tool_name", "")
+    if tool_name == "Bash":
+        command = (event.get("tool_input") or {}).get("command")
+        if not isinstance(command, str) or not GH_WRITE.search(command):
+            sys.exit(0)
+    path = pending_path(event.get("session_id", ""))
+    pending = read_pending(path)
+    if pending and pending.get("tool") == tool_name:
+        clear_pending(path)
+        write_count(state_path(event.get("session_id", "")), 0)
+    sys.exit(0)
+
+
+def handle_unfinished_write(event):
+    """止められた書き込みを未完のままターンを終えようとしたら押し戻す."""
+    path = pending_path(event.get("session_id", ""))
+    pending = read_pending(path)
+    if not pending:
+        return
+    # 押し戻すのは 1 回だけにする. 直せない指摘で往復し続けるのを避ける
+    clear_pending(path)
+    if time.time() - float(pending.get("at") or 0) > PENDING_TTL:
+        return
+    emit({
+        "decision": "block",
+        "reason": (
+            "hook に止められた %s の書き込みが, 未完のまま残っている.\n"
+            "%s\n"
+            "書き込みをやめる判断をしたのなら, その理由を user に伝えてから終われ."
+            % (pending.get("tool") or "本文", RESUME)
+        ),
+    })
+
+
+def handle_chat_style(event):
     if os.environ.get(CHAT_STYLE_ENV) not in ("1", "true", "yes"):
         sys.exit(0)
 
@@ -263,6 +339,11 @@ def handle_pre_tool_use(event):
     if sum(len(text) for _, text in segments) < MIN_LEN_TOOL:
         sys.exit(0)
 
+    # 本文を伴う書き込みを試みたことを記録する. 通れば PostToolUse が畳む.
+    # どの層かを問わず deny されるとフラグが残り, Stop が押し戻す.
+    write_pending(pending_path(event.get("session_id", "")),
+                  {"tool": tool_name, "at": time.time()})
+
     findings = []
     for label, text in segments:
         findings.extend(inspect(label, text, tool_name, draft=True))
@@ -276,11 +357,14 @@ def handle_pre_tool_use(event):
     write_count(path, count)
     reason = build_reason(
         findings,
-        "書き込み前の機械チェックで規範違反を検出した. 該当箇所を直してから再度書き込むこと.\n"
+        "書き込み前の機械チェックで規範違反を検出した.\n"
+        + RESUME + "\n"
         "これは機械判定だけである. 素読みや事実と推測の分離は検査していない.")
 
     if count > MAX_BLOCKS:
         write_count(path, 0)
+        # 人に委ねた時点で押し戻す相手が Claude ではなくなるので, フラグを畳む
+        clear_pending(pending_path(event.get("session_id", "")))
         emit({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -306,8 +390,12 @@ def main():
     except ValueError:
         sys.exit(0)
 
-    if event.get("hook_event_name") == "Stop":
-        handle_stop(event)
+    name = event.get("hook_event_name")
+    if name == "Stop":
+        handle_unfinished_write(event)
+        handle_chat_style(event)
+    elif name == "PostToolUse":
+        handle_post_tool_use(event)
     else:
         handle_pre_tool_use(event)
 
