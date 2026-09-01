@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""rules/semantic-rules.md から hooks/hooks.json を組み立てる.
-
-規範の単一の出所は rules/semantic-rules.md である. prompt hook は Read を持たないので,
-規範は prompt に埋め込む. semantic-rules.md を編集したらこれを実行して commit する.
+"""hooks/hooks.json を組み立てる.
 
     /usr/bin/python3 plugins/review-draft/scripts/sync-hooks.py
 
 hook は 3 層ある.
 
 - 機械チェック (command hook, 40ms) 文体と Markdown の構造
-- 素読み (prompt hook, 4s) 文脈ゼロの読者として通読し, つまずいた箇所を返す
-- 規範照合 (prompt hook, 5s) 埋め込んだ規範と本文を突き合わせる
+- 素読み (prompt hook) 文脈ゼロの読者として通読し, つまずいた箇所を返す
+- 規範照合 (agent hook) rules/semantic-rules.md を Read して本文と突き合わせる
 
-prompt hook は同じ group 内で並列に走るので, 待ち時間は遅い方の 1 本ぶんで済む.
+規範照合を agent hook にしてあるのは 2 つの理由による. 1 つは Read を持つので規範を
+prompt に埋め込まずに済むこと. Claude Code は hook が返す指摘に prompt 全文を添えるので,
+埋め込むとその全文が指摘のたびにコンテキストへ入る. もう 1 つは prompt hook が
+`[prompt]: reason` と `from command` の 2 箇所に prompt を写すのに対し, agent hook は
+1 箇所で済むことである.
+
+実測 (本文 140-180 文字, 指摘あり) は agent hook が 26-30s, prompt hook が 10s だった.
+対象外の Bash 呼び出しでは agent hook が 2.89s, prompt hook が 3.20s で, agent のほうが
+わずかに速い. 対象外と判定するとき agent は tool を使わず 1 往復で返し, prompt が短い分だけ
+読む量も少ない.
+
+prompt hook と agent hook は同じ group 内で並列に走るので, 待ち時間は遅い方の 1 本ぶんで済む.
 
 3 層とも PostToolUse に置く. 書き込みは止めず, 指摘だけを Claude に返す.
 反映するかは Claude が決める. PreToolUse に置くと prompt hook は ok: false を
@@ -54,12 +62,17 @@ BASH_SCOPE = (
 # prompt hook / agent hook は hookSpecificOutput ではなく ok / reason を返す.
 # 書き込みは既に通っているので, reason は「直せ」ではなく判断材料として返す.
 # ただし指摘だけを返すと「user に報告して終わる合図」に読まれるので, 選択肢を明示する.
+RESUME_LINE = (
+    "書き込みは既に通っている. 反映する価値があると判断したら, 同じ tool で本文を書き直せ."
+    " 見送るならその判断を user に一言添えよ."
+)
+
+# prompt hook は ok / reason を JSON で返す. agent hook は tool 呼び出しで返すので
+# この出力形式は要らない.
 OUTPUT = (
     "出力は JSON だけにせよ. 前置きも説明も code fence も付けるな.\n"
     "問題が無い: {\"ok\": true}\n"
-    "問題がある: {\"ok\": false, \"reason\": \"<指摘>\\n\\n"
-    "書き込みは既に通っている. 反映する価値があると判断したら, 同じ tool で本文を書き直せ."
-    " 見送るならその判断を user に一言添えよ.\"}\n"
+    "問題がある: {\"ok\": false, \"reason\": \"<指摘>\\n\\n" + RESUME_LINE + "\"}\n"
     "reason は日本語で書け. 末尾の 1 行はそのまま書き写せ."
 )
 
@@ -111,19 +124,22 @@ READER_PROMPT = (
 
 
 def rules_prompt():
-    with open(RULES) as handle:
-        rules = handle.read().strip()
+    """規範は埋め込まない. agent が実行時に Read する.
+
+    semantic-rules.md を編集しても, これを実行し直す必要は無い.
+    """
     return (
         "$ARGUMENTS は Claude Code の PostToolUse hook の入力 JSON である.\n"
         + SCOPE +
-        "\n本文を次の規範と照合せよ.\n\n"
-        "<規範>\n" + rules + "\n</規範>\n\n"
+        "\n規範は ${CLAUDE_PLUGIN_ROOT}/rules/semantic-rules.md にある."
+        " Read で読んでから本文と照合せよ.\n"
         "規範違反があるときだけ ok: false を返せ."
         " reason には原文からの引用, 違反した規範の項目名, 具体的な直し方を書け.\n"
         "規範に項目が無い好みの問題は挙げるな. 会話の経緯は与えられていないので,"
         " 本文だけで判断せよ. 迷ったら ok: true を返せ.\n\n"
-        + BAR
-        + "\n" + OUTPUT
+        + BAR +
+        "\nreason は日本語で書け. 末尾に次の 1 行をそのまま付けよ.\n"
+        + RESUME_LINE
     )
 
 
@@ -134,6 +150,17 @@ def gate_hook(status):
         "args": [GATE],
         "statusMessage": status,
         "timeout": 15,
+    }
+
+
+def agent_hook(prompt, status):
+    return {
+        "type": "agent",
+        "prompt": prompt,
+        "model": MODEL,
+        "statusMessage": status,
+        # 実測 26-30s. 既定の 60s のままだと打ち切りが遠すぎるので明示しておく
+        "timeout": 60,
     }
 
 
@@ -167,7 +194,7 @@ def main():
                     "hooks": [
                         gate_hook("下書きの機械チェック"),
                         prompt_hook(reader, "文脈ゼロの素読み"),
-                        prompt_hook(checker, "規範との照合"),
+                        agent_hook(checker, "規範との照合"),
                     ],
                 },
                 {
@@ -175,7 +202,7 @@ def main():
                     "hooks": [
                         gate_hook("下書きの機械チェック"),
                         prompt_hook(reader, "文脈ゼロの素読み"),
-                        prompt_hook(checker, "規範との照合"),
+                        agent_hook(checker, "規範との照合"),
                     ],
                 },
             ],

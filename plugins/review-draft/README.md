@@ -8,13 +8,13 @@ Linear / esa / GitHub に投稿する日本語の文章を, 書き込みが実�
 
 3 層に分かれている.
 
-| 層 | 実装 | 実測 | 見るもの |
-| --- | --- | --- | --- |
-| 機械チェック | command hook (python) | 40ms | 文体, Markdown の構造, 変更履歴, パス省略 |
-| 素読み | prompt hook (haiku) | 4s | 文脈ゼロの読者としてつまずいた箇所 |
-| 規範照合 | prompt hook (haiku) | 5s | 規範との突き合わせ |
+| 層 | 実装 | 見るもの |
+| --- | --- | --- |
+| 機械チェック | command hook (python) | 文体, Markdown の構造, 変更履歴, パス省略 |
+| 素読み | prompt hook (haiku) | 文脈ゼロの読者としてつまずいた箇所 |
+| 規範照合 | agent hook (haiku) | `rules/semantic-rules.md` を読んでの突き合わせ |
 
-prompt hook は並列に走るので, 待ち時間は遅い方の 1 本ぶんで済む.
+3 本は並列に走るので, 待ち時間は遅い方の 1 本ぶんで済む.
 
 3 層とも PostToolUse に置いてある. 違反があっても書き込みは止まらず, 指摘だけが Claude に返る. 反映して書き直すか, 見送って user に伝えるかは Claude が決める.
 
@@ -28,6 +28,22 @@ prompt hook は並列に走るので, 待ち時間は遅い方の 1 本ぶんで
 指摘だけを返すと「user に報告して終わる合図」と読まれるので, 選べることを明示する文を必ず添える. 反映する価値があると判断したら同じ tool で書き直す, 見送るならその判断を user に一言添える, のどちらかである.
 
 prompt hook の指摘が毎回変わると収束しないので, 挙げてよい指摘の水準も prompt に固定してある. 逐語引用を添えられること, 直さなければ読者が誤解すること, 1 度に 2 件までである.
+
+## 規範照合を agent hook にしてある理由
+
+Claude Code は hook が返す指摘に prompt 全文を添える. prompt hook は `from command: "<prompt>"` と `[<prompt>]:` の 2 箇所に写すので, 規範を埋め込んだ 3130 文字の prompt が指摘 1 件につき 2 回コンテキストへ入っていた. agent hook は Read を持つので規範を埋め込まずに済み, 写る箇所も 1 箇所である.
+
+実測はこうなった.
+
+| 条件 | prompt hook | agent hook |
+| --- | --- | --- |
+| 対象外の Bash 呼び出し | 3.20s | 2.89s |
+| 本文 140-180 文字, 指摘あり | 10.02s | 26-30s |
+| 指摘 1 件あたりの写り込み | 約 6.3KB | 約 1.3KB |
+
+対象外と判定するときは agent のほうがわずかに速い. tool を使わず 1 往復で返し, prompt が短い分だけ読む量も少ないためである. 遅くなるのは実際に書き込んだときだけで, 書き込みは止まらないので待ち時間が作業を詰まらせることは無い.
+
+指摘の質も上がる. 規範ファイルを読むので, 違反した項目を見出し番号ごと引用してくる.
 
 ## 発火する場所
 
@@ -70,13 +86,15 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 
 ## 規範を直す
 
-規範の単一の出所は `rules/semantic-rules.md` である. prompt hook は Read を持たないので, 規範は生成時に prompt へ埋め込む.
+規範の単一の出所は `rules/semantic-rules.md` である. agent hook が実行時に Read するので, 規範を直しただけなら再生成は要らない.
+
+`hooks/hooks.json` を直すときだけ生成し直す.
 
 ```bash
 /usr/bin/python3 plugins/review-draft/scripts/sync-hooks.py
 ```
 
-`hooks/hooks.json` が再生成されるので, rules と一緒に commit する. `hooks/hooks.json` を手で編集しても次の生成で消える.
+`hooks/hooks.json` を手で編集しても次の生成で消える.
 
 `rules/writing-rules.md` は機械チェックが返す項目名の参照先である. 判定そのものは `hooks/review-draft-gate.py` の正規表現が持つ.
 
@@ -92,6 +110,8 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 
 - `model` に `haiku` のような alias を書くと 404 になる. `claude-haiku-4-5-20251001` と完全な id を書く
 - prompt hook と agent hook が返すのは `{"ok": bool, "reason": str}` である. `hookSpecificOutput.permissionDecision` は解釈されない
+- agent hook が使えるのは tool event (PreToolUse, PostToolUse, PermissionRequest) だけである. model の既定は Haiku, timeout の既定は 60s
+- agent hook の prompt では `${CLAUDE_PLUGIN_ROOT}` が解決される. plugin 内のファイルを Read させられる
 - prompt hook の `ok: false` は必ず `decision: "block"` になる. PreToolUse に置く限り書き込みは deny される. `continueOnBlock` が制御するのはターンを続けるかどうかだけで, tool の deny は取り消せない
 - PostToolUse の入力 JSON には `tool_response` が入る. Bash では実行結果ごと prompt hook に渡るので, 検査対象外だと prompt 側で明示する
 - Stop hook は `{"decision": "block", "reason": "..."}` を返す
