@@ -9,6 +9,10 @@ hook は 3 層ある.
 - 素読み (prompt hook) 文脈ゼロの読者として通読し, つまずいた箇所を返す
 - 規範照合 (agent hook) rules/semantic-rules.md を Read して本文と突き合わせる
 
+LLM の 2 層が載るのは MCP の書き込み tool だけである. Bash は機械チェックだけにしてある.
+PostToolUse の入力 JSON には tool_response が入るので, Bash に LLM 層を置くと
+gh pr view のような読み取り専用コマンドの出力まで下書きとして読んでしまう.
+
 規範照合を agent hook にしてあるのは 2 つの理由による. 1 つは Read を持つので規範を
 prompt に埋め込まずに済むこと. Claude Code は hook が返す指摘に prompt 全文を添えるので,
 埋め込むとその全文が指摘のたびにコンテキストへ入る. もう 1 つは prompt hook が
@@ -45,18 +49,6 @@ WRITE_TOOLS = (
     "|mcp__github__(issue_write|pull_request_write|create_issue|update_issue"
     "|add_issue_comment|create_pull_request|update_pull_request"
     "|add_comment_to_pending_review|create_and_submit_pull_request_review)"
-)
-
-# Bash の絞り込みに if は使えない. `cd x && echo y` のように && を含むコマンドは
-# Bash(gh pr create:*) を含む全ての rule に「条件成立」と判定される (実測).
-# その結果 1 コマンドにつき haiku が 14 本走り, コマンドに混じった日本語が
-# 下書きとして deny される. 絞り込みは prompt 側の BASH_SCOPE で行う.
-BASH_SCOPE = (
-    "tool_name が Bash のときは, 次の gh コマンドが書き込む本文だけが対象である.\n"
-    "gh pr create / edit / comment / review, gh issue create / edit / comment\n"
-    "本文は --body か --title の値, または heredoc の中身である.\n"
-    "これに当てはまらない Bash コマンドは, 日本語が含まれていても必ず"
-    " {\"ok\": true} を返せ. コマンドの中の文字列 / 変数 / テストデータは検査対象ではない.\n"
 )
 
 # prompt hook / agent hook は hookSpecificOutput ではなく ok / reason を返す.
@@ -100,7 +92,6 @@ SCOPE = (
     "- patch で差分だけが渡された場合は, 差分に現れた記述だけを対象にする\n"
     "\n"
     "tool_response は書き込みの結果であって下書きではない. 検査せず, 引用もするな.\n"
-    "\n" + BASH_SCOPE
 )
 
 READER_PROMPT = (
@@ -197,13 +188,13 @@ def main():
                         agent_hook(checker, "規範との照合"),
                     ],
                 },
+                # Bash には機械チェックだけを置く. PostToolUse の入力 JSON には
+                # tool_response が入るので, LLM 層を置くと gh pr view のような
+                # 読み取り専用コマンドの出力を下書きとして読んで誤指摘を返す.
+                # 「tool_response を検査するな」は prompt の指示にすぎず守られない.
                 {
                     "matcher": "Bash",
-                    "hooks": [
-                        gate_hook("下書きの機械チェック"),
-                        prompt_hook(reader, "文脈ゼロの素読み"),
-                        agent_hook(checker, "規範との照合"),
-                    ],
+                    "hooks": [gate_hook("下書きの機械チェック")],
                 },
             ],
             "Stop": [

@@ -42,8 +42,14 @@ CHOICE = ("反映する価値があると判断したら, 同じ tool で本文�
 TEXT_KEYS = ("title", "name", "description", "body", "body_md", "content")
 PATCH_KEYS = ("new_string", "text")
 
+# コマンド片の先頭に来たときだけ書き込みとみなす. 引用符の中やテストデータに
+# 現れた同じ字面を拾わないよう, 前置きに許すのは環境変数の代入だけである.
 GH_WRITE = re.compile(
-    r"\bgh\s+(pr|issue|release)\s+(create|edit|comment|review|update)\b")
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"gh\s+(?:pr|issue|release)\s+(?:create|edit|comment|review|update)\b")
+
+# コマンド片の切れ目. 引用符の外に現れたものだけを切れ目として扱う
+SEPARATORS = ("&&", "||", ";", "|", "\n", "&")
 
 LLM_PHRASES = (
     "重要なのは", "本節では", "本記事では", "本章では", "まとめると", "要するに",
@@ -100,25 +106,78 @@ def collect_from_tool_input(tool_input):
     return segments
 
 
-def collect_from_bash(command):
-    """gh コマンドから PR / issue の本文を取り出す."""
-    if not GH_WRITE.search(command):
-        return []
-    segments = []
-    for name, body in HEREDOC.findall(command):
-        segments.append(("heredoc<%s>" % name, body))
-    if not segments:
-        for _, body in INLINE_BODY.findall(command):
-            segments.append(("--body", body))
-    for path in BODY_FILE.findall(command):
-        path = path.strip("'\"")
-        if path == "-":
+def mask_heredocs(command):
+    """heredoc の中身を空白で潰した文字列と, (名前, 中身, << の位置) を返す.
+
+    中身を潰しておかないと, コマンド片を切り分けるときに heredoc の中の
+    セミコロンやパイプを切れ目と誤読する.
+    """
+    masked = list(command)
+    found = []
+    for hit in HEREDOC.finditer(command):
+        found.append((hit.group(1), hit.group(2), hit.start()))
+        for index in range(hit.start(2), hit.end(2)):
+            masked[index] = " "
+    return "".join(masked), found
+
+
+def split_commands(masked):
+    """引用符の外の区切りでコマンド片に分け, (開始, 終了) の list を返す."""
+    spans = []
+    start = 0
+    quote = None
+    index = 0
+    while index < len(masked):
+        char = masked[index]
+        if quote:
+            if char == quote:
+                quote = None
+            index += 1
             continue
-        try:
-            with open(os.path.expanduser(path)) as handle:
-                segments.append(("--body-file %s" % path, handle.read()))
-        except IOError:
-            pass
+        if char in "'\"":
+            quote = char
+            index += 1
+            continue
+        for sep in SEPARATORS:
+            if masked.startswith(sep, index):
+                spans.append((start, index))
+                index += len(sep)
+                start = index
+                break
+        else:
+            index += 1
+    spans.append((start, len(masked)))
+    return [(a, b) for a, b in spans if masked[a:b].strip()]
+
+
+def collect_from_bash(command):
+    """gh の書き込みコマンドから PR / issue の本文を取り出す.
+
+    本文とみなすのは, 書き込みコマンドの片の中にあるものだけである. 同じコマンド行に
+    別の heredoc やテストデータが並んでいても混ぜない.
+    """
+    masked, heredocs = mask_heredocs(command)
+    segments = []
+    for start, end in split_commands(masked):
+        piece = masked[start:end].lstrip()
+        if not GH_WRITE.match(piece):
+            continue
+        inside = [(name, body) for name, body, at in heredocs if start <= at < end]
+        for name, body in inside:
+            segments.append(("heredoc<%s>" % name, body))
+        # heredoc がある片では --body の値が $(cat <<EOF ...) になる. 二重に取らない
+        if not inside:
+            for _, body in INLINE_BODY.findall(masked[start:end]):
+                segments.append(("--body", body))
+        for path in BODY_FILE.findall(masked[start:end]):
+            path = path.strip("'\"")
+            if path == "-":
+                continue
+            try:
+                with open(os.path.expanduser(path)) as handle:
+                    segments.append(("--body-file %s" % path, handle.read()))
+            except IOError:
+                pass
     return segments
 
 

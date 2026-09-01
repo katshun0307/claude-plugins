@@ -8,11 +8,11 @@ Linear / esa / GitHub に投稿する日本語の文章を, 書き込みが実�
 
 3 層に分かれている.
 
-| 層 | 実装 | 見るもの |
-| --- | --- | --- |
-| 機械チェック | command hook (python) | 文体, Markdown の構造, 変更履歴, パス省略 |
-| 素読み | prompt hook (haiku) | 文脈ゼロの読者としてつまずいた箇所 |
-| 規範照合 | agent hook (haiku) | `rules/semantic-rules.md` を読んでの突き合わせ |
+| 層 | 実装 | 見るもの | 載る場所 |
+| --- | --- | --- | --- |
+| 機械チェック | command hook (python) | 文体, Markdown の構造, 変更履歴, パス省略 | MCP と Bash |
+| 素読み | prompt hook (haiku) | 文脈ゼロの読者としてつまずいた箇所 | MCP のみ |
+| 規範照合 | agent hook (haiku) | `rules/semantic-rules.md` を読んでの突き合わせ | MCP のみ |
 
 3 本は並列に走るので, 待ち時間は遅い方の 1 本ぶんで済む.
 
@@ -53,9 +53,17 @@ Claude Code は hook が返す指摘に prompt 全文を添える. prompt hook �
 - `gh pr create`, `gh pr edit`, `gh pr comment`, `gh pr review`, `gh issue create`, `gh issue edit`, `gh issue comment`
 - チャット出力 (機械チェックのみ. 既定では無効)
 
-`gh` は heredoc, `--body`, `--body-file` のどれからでも本文を取り出す. ただし `--body-file` の中身を読めるのは機械チェックだけで, prompt hook は Read を持たないので検査しない.
+`gh` 経由の書き込みは機械チェックだけを通る. heredoc, `--body`, `--body-file` のどれからでも本文を取り出す.
 
-Bash の絞り込みに `if` は使っていない. 理由は後述する. 代わりに prompt の中で「gh の書き込みコマンドの本文以外は必ず ok を返す」と指示している.
+## Bash に LLM の層を載せない
+
+PostToolUse の入力 JSON には `tool_response` が入る. `gh pr view` の出力は PR 本文そのものなので, Bash に prompt hook や agent hook を載せると, 読み取り専用のコマンドの出力を下書きとして読んで誤指摘を返す. prompt に「`tool_response` は検査するな」と書いても指示にすぎず守られない (実測で再現した).
+
+`if` による絞り込みでは解けない. 書き込みコマンドは 7 通りあり, `if` は permission rule を 1 つしか解釈しないので hook を 7 本に割ることになる. LLM の層が 2 本あるので 1 コマンドにつき 14 本走る. `if` は `&&` を含むコマンドを絞り込めず全ての rule に一致するため, これは書き込みとは無関係なコマンドでも起きる. 待ち時間と API 呼び出しがその本数だけ積む.
+
+そのため Bash には機械チェックだけを置いてある. `gh pr create` の本文に素読みと規範照合をかけたいなら, MCP の GitHub tool から書き込む.
+
+機械チェックが本文とみなすのは, gh の書き込みコマンドの片の中にあるものだけである. コマンド行に無関係な heredoc が並んでいても, 引用符の中に同じ字面があっても混ぜない.
 
 ## 導入
 
@@ -101,6 +109,7 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 ## 暴走の防ぎ方
 
 - 書き込みそのものを止める経路が無い. 指摘が的外れでも投稿は通る
+- Bash では LLM を呼ばない. 読み取り専用のコマンドで haiku が走ることは無い
 - Stop の文体チェックは prompt_id ごとに 1 回しか差し戻さない
 - code fence, blockquote, inline code, indent された block は検査対象から外す. log や引用が引っかからない
 
@@ -113,7 +122,7 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 - agent hook が使えるのは tool event (PreToolUse, PostToolUse, PermissionRequest) だけである. model の既定は Haiku, timeout の既定は 60s
 - agent hook の prompt では `${CLAUDE_PLUGIN_ROOT}` が解決される. plugin 内のファイルを Read させられる
 - prompt hook の `ok: false` は必ず `decision: "block"` になる. PreToolUse に置く限り書き込みは deny される. `continueOnBlock` が制御するのはターンを続けるかどうかだけで, tool の deny は取り消せない
-- PostToolUse の入力 JSON には `tool_response` が入る. Bash では実行結果ごと prompt hook に渡るので, 検査対象外だと prompt 側で明示する
+- PostToolUse の入力 JSON には `tool_response` が入る. LLM の層に渡すと実行結果まで検査してしまうので, 載せる matcher を選ぶ
 - Stop hook は `{"decision": "block", "reason": "..."}` を返す
 - `if` は permission rule を 1 つしか解釈しない. `|` で連結すると常に不一致になる
 - `if` は `&&` を含むコマンドを絞り込めない. `cd /tmp && echo done` は `Bash(gh pr create:*)` を含む全ての rule に「条件成立」と判定される. rule ごとに hook を分けて置くと, 1 コマンドにつき hook がその本数だけ走り, コマンドに混じった日本語が下書きとして deny される. Bash の絞り込みは prompt 側で行う
