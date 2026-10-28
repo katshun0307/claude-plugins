@@ -5,17 +5,26 @@
   },
   "metadata": {
     "description": "個人用の Claude Code plugin",
-    "version": "0.4.1"
+    "version": "0.6.0"
   },
   "plugins": [
     {
       "name": "review-draft",
       "description": "Linear / esa / GitHub に投稿する日本語の下書きを, 書き込んだ直後に規範と照合する hook. 機械チェック, 文脈ゼロの素読み, 規範との照合の 3 層で見る. 書き込みは止めず, 指摘を反映するかは Claude が決める.",
-      "version": "0.4.1",
+      "version": "0.5.0",
       "author": {
         "name": "katshun0307"
       },
       "source": "./plugins/review-draft"
+    },
+    {
+      "name": "expense-report",
+      "description": "領収書のフォルダから freee の経費申請を組み立て, 下書き (draft) として登録し, ブラウザ経由で領収書をアップロードして明細に添付し, 適格請求書発行事業者 登録番号まで設定する skill. 過去の申請を型として読み, 出張の交通費は乗換案内で運賃を積む. freee API の落とし穴 (purchase_lines 構造, 摘要 250 文字上限, PUT の全置換, receipt_id の特定, 承認者が下書きに保存できない) を踏まずに済む.",
+      "version": "0.2.0",
+      "author": {
+        "name": "katshun0307"
+      },
+      "source": "./plugins/expense-report"
     }
   ]
 }

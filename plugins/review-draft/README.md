@@ -92,6 +92,21 @@ claude plugin marketplace add ~/ghq/github.com/katshun0307/claude-plugins
 
 有効にすると, Claude の応答が文体の規範に反したときに 1 ターンにつき 1 回だけ書き直させる.
 
+## チャット出力の issue リンク検査
+
+チャットで issue 識別子 (`SCR-123` など) をリンクにせず書いたら書き直させる. 識別子の prefix はチームごとに違うので, 既定では無効にしてある. 有効にするなら prefix をカンマ区切りで置く. `REVIEW_DRAFT_ISSUE_URL` を置くと, 指摘に正しいリンクの書式が添えられる.
+
+```json
+{
+  "env": {
+    "REVIEW_DRAFT_ISSUE_PREFIXES": "SCR,MNT,QA",
+    "REVIEW_DRAFT_ISSUE_URL": "https://linear.app/omni-hub/issue/{id}"
+  }
+}
+```
+
+Markdown リンクの中, 素の URL の中, inline code, code fence, 引用の中の識別子は対象外である. 文体検査と同じく, 書き直させるのは 1 ターンにつき 1 回までである.
+
 ## 規範を直す
 
 規範の単一の出所は `rules/semantic-rules.md` である. agent hook が実行時に Read するので, 規範を直しただけなら再生成は要らない.

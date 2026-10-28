@@ -5,7 +5,8 @@
 
 - PostToolUse: Linear / esa / GitHub への書き込みと, gh コマンドでの PR / issue 本文
 - Stop: そのターンで user に出したチャットの文章.
-  文体は個人の規範なので, 環境変数 REVIEW_DRAFT_CHAT_STYLE=1 を置いた人にだけ効く
+  文体は個人の規範なので, 環境変数 REVIEW_DRAFT_CHAT_STYLE=1 を置いた人にだけ効く.
+  issue 識別子のリンク化は REVIEW_DRAFT_ISSUE_PREFIXES を置いた人にだけ効く
 
 意味的なレビュー (素読み, 事実と推測の分離, 記載範囲) はここでは扱わない.
 そちらは prompt hook と agent hook が受け持つ.
@@ -26,6 +27,14 @@ import sys
 
 # チャットの文体検査は個人の規範なので, 明示的に有効にした人にだけ効かせる
 CHAT_STYLE_ENV = "REVIEW_DRAFT_CHAT_STYLE"
+
+# チャットで issue 識別子をリンクにせず書いたら差し戻す. 識別子の prefix は
+# チームごとに違うので, カンマ区切りで指定した人にだけ効かせる (例: SCR,MNT,QA)
+ISSUE_PREFIXES_ENV = "REVIEW_DRAFT_ISSUE_PREFIXES"
+# 指摘に添えるリンクの書式. {id} が識別子に置き換わる (例: https://linear.app/omni-hub/issue/{id})
+ISSUE_URL_ENV = "REVIEW_DRAFT_ISSUE_URL"
+MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\([^)]*\)")
+BARE_URL = re.compile(r"https?://\S+")
 
 RULES_DOC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "rules", "writing-rules.md")
@@ -325,15 +334,51 @@ def handle_post_tool_use(event):
     })
 
 
+def issue_pattern():
+    prefixes = [p.strip() for p in os.environ.get(ISSUE_PREFIXES_ENV, "").split(",")
+                if re.match(r"^[A-Za-z][A-Za-z0-9]*$", p.strip())]
+    if not prefixes:
+        return None
+    return re.compile(r"(?<![A-Za-z0-9/_-])(?:%s)-\d+(?![A-Za-z0-9_])"
+                      % "|".join(re.escape(p) for p in prefixes))
+
+
+def inspect_issue_links(label, text, pattern):
+    """リンクになっていない issue 識別子を探す.
+
+    Markdown リンクの中 (リンクテキストと URL) と素の URL の中は対象外にする.
+    code と引用は mask で落ちる.
+    """
+    findings = []
+    template = os.environ.get(ISSUE_URL_ENV, "")
+    originals = text.split("\n")
+    for lineno, line in enumerate(mask(text).split("\n"), start=1):
+        stripped = BARE_URL.sub(" ", MARKDOWN_LINK.sub(" ", line))
+        for hit in pattern.finditer(stripped):
+            identifier = hit.group(0)
+            fix = "[%s](%s)" % (identifier, template.replace("{id}", identifier)) \
+                if template else "[%s](<issue の URL>)" % identifier
+            findings.append(("issue 識別子はリンクにする", label, lineno,
+                             originals[lineno - 1].strip(),
+                             "%s → %s" % (identifier, fix)))
+    return findings
+
+
 def handle_chat_style(event):
-    if os.environ.get(CHAT_STYLE_ENV) not in ("1", "true", "yes"):
+    style_enabled = os.environ.get(CHAT_STYLE_ENV) in ("1", "true", "yes")
+    pattern = issue_pattern()
+    if not style_enabled and pattern is None:
         sys.exit(0)
 
     message = event.get("last_assistant_message")
     if not isinstance(message, str) or len(message.strip()) < MIN_LEN_CHAT:
         sys.exit(0)
 
-    findings = inspect("chat", message, "", draft=False)
+    findings = []
+    if style_enabled:
+        findings.extend(inspect("chat", message, "", draft=False))
+    if pattern is not None:
+        findings.extend(inspect_issue_links("chat", message, pattern))
     if not findings:
         sys.exit(0)
 
@@ -346,7 +391,7 @@ def handle_chat_style(event):
 
     reason = build_reason(
         findings,
-        "直前のチャット出力が文体の規範に反している. 同じ内容を規範に沿って書き直して user に出し直せ.")
+        "直前のチャット出力がチャットの規範に反している. 同じ内容を規範に沿って書き直して user に出し直せ.")
     emit({
         "hookSpecificOutput": {
             "hookEventName": "Stop",
